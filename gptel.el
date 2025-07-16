@@ -109,7 +109,7 @@
 ;;   prompt/response.
 ;;
 ;; To use this in a dedicated buffer:
-;; 
+;;
 ;; - M-x gptel: Start a chat session.
 ;;
 ;; - In the chat session: Press `C-c RET' (`gptel-send') to send your prompt.
@@ -126,7 +126,7 @@
 ;;   (described next), or include them as links in Org or Markdown mode chat
 ;;   buffers.  Sending media is disabled by default, you can turn it on globally
 ;;   via `gptel-track-media', or locally in a chat buffer via the header line.
-;; 
+;;
 ;; Include more context with requests:
 ;;
 ;; If you want to provide the LLM with more context, you can add arbitrary
@@ -175,11 +175,11 @@
 ;;
 ;; - You can limit the conversation context to an Org heading with
 ;;   `gptel-org-set-topic'.
-;;   
+;;
 ;; - You can have branching conversations in Org mode, where each hierarchical
 ;;   outline path through the document is a separate conversation branch.
 ;;   See the variable `gptel-org-branching-context'.
-;;   
+;;
 ;; - You can declare the gptel model, backend, temperature, system message and
 ;;   other parameters as Org properties with the command
 ;;   `gptel-org-set-properties'.  gptel queries under the corresponding heading
@@ -775,6 +775,736 @@ This opens up advanced options in `gptel-menu'.")
 
 (defvar-local gptel--bounds nil)
 (put 'gptel--bounds 'safe-local-variable #'always)
+
+(defvar-local gptel--message-boundaries nil
+  "List of message boundaries for enhanced state tracking.
+Each entry is (START END ROLE TIMESTAMP MESSAGE-ID).")
+(put 'gptel--message-boundaries 'safe-local-variable #'always)
+
+;; Enhanced state tracking using markers and overlays
+(defvar-local gptel--conversation-markers nil
+  "List of markers tracking conversation structure.
+Each marker has a 'gptel-role property ('user or 'assistant) and
+a 'gptel-message-id property for identification.")
+
+(defvar-local gptel--message-overlays nil
+  "List of overlays for message content regions.
+Each overlay represents a user or assistant message with rich metadata.")
+
+(defvar-local gptel--message-counter 0
+  "Counter for generating unique message IDs.")
+
+(defvar-local gptel--current-response-marker nil
+  "Marker tracking the current response insertion point.")
+
+(defcustom gptel-enable-visual-debugging nil
+  "Whether to enable visual debugging of conversation state.
+
+When non-nil, gptel will display visual indicators showing:
+- Conversation boundaries with colored overlays
+- Message markers with red dots
+- User/assistant message highlighting
+
+This can be toggled interactively with `gptel-toggle-debug-view'."
+  :type 'boolean
+  :safe #'booleanp)
+
+(defcustom gptel-enable-enhanced-state-tracking nil
+  "Whether to enable enhanced state tracking with markers and overlays.
+
+When non-nil, gptel will use a more robust state tracking system
+that survives complex editing operations better than text properties.
+
+This includes:
+- Marker-based position tracking
+- Overlay-based message regions
+- Enhanced recovery functions
+- Persistent state across save/load
+
+This is experimental and may change in future versions."
+  :type 'boolean
+  :safe #'booleanp)
+
+(defcustom gptel-enable-strict-validation nil
+  "Whether to enable strict validation of conversation state.
+
+When non-nil, gptel will perform comprehensive validation of
+conversation state including:
+- Overlap detection between user and assistant messages
+- Consistency checking between markers and overlays
+- Boundary validation during state operations
+
+This provides additional safety but may impact performance.
+Only effective when `gptel-enable-enhanced-state-tracking' is also enabled."
+  :type 'boolean
+  :safe #'booleanp)
+
+(defcustom gptel-auto-repair-invalid-state t
+  "Whether to automatically repair invalid conversation states.
+
+When non-nil, gptel will attempt to automatically fix invalid
+states such as overlapping message boundaries or inconsistent
+markers. When nil, invalid states will be logged but not repaired.
+
+Only effective when `gptel-enable-enhanced-state-tracking' is enabled."
+  :type 'boolean
+  :safe #'booleanp)
+
+(defcustom gptel-validation-log-level 'warn
+  "Level of validation logging to display.
+
+Controls how verbose validation warnings and errors are:
+- 'error: Only show critical validation errors
+- 'warn: Show warnings and errors (default)
+- 'info: Show informational messages, warnings, and errors
+- 'debug: Show all validation messages including debug info
+- nil: Disable validation logging
+
+Only effective when `gptel-enable-enhanced-state-tracking' is enabled."
+  :type '(choice (const :tag "Errors only" error)
+                 (const :tag "Warnings and errors" warn)
+                 (const :tag "Info, warnings, and errors" info)
+                 (const :tag "All messages" debug)
+                 (const :tag "No logging" nil))
+  :safe #'symbolp)
+
+(defun gptel--generate-message-id ()
+  "Generate a unique message ID for the current buffer."
+  (format "msg-%d-%d" (buffer-modified-tick) (cl-incf gptel--message-counter)))
+
+(defun gptel--create-message-marker (position role)
+  "Create a marker at POSITION with ROLE metadata.
+ROLE should be 'user or 'assistant."
+  (let ((marker (set-marker (make-marker) position)))
+    (put-text-property 0 1 'gptel-role role (symbol-name role))
+    (put-text-property 0 1 'gptel-message-id (gptel--generate-message-id) (symbol-name role))
+    (push marker gptel--conversation-markers)
+    marker))
+
+(defun gptel--create-message-overlay (start end role &optional message-id)
+  "Create an overlay from START to END with ROLE metadata.
+ROLE should be 'user or 'assistant.
+MESSAGE-ID is optional, will be generated if not provided."
+  (let ((overlay (make-overlay start end nil t))
+        (id (or message-id (gptel--generate-message-id))))
+    (overlay-put overlay 'gptel-role role)
+    (overlay-put overlay 'gptel-message-id id)
+    (overlay-put overlay 'gptel-timestamp (current-time))
+    (overlay-put overlay 'evaporate t)
+    (overlay-put overlay 'category 'gptel-message)
+
+    ;; Visual styling based on role (following gptel-context pattern)
+    (when gptel-enable-visual-debugging
+      (pcase role
+        ('user
+         (overlay-put overlay 'face 'gptel-user-header))
+        ('assistant
+         (overlay-put overlay 'face 'gptel-assistant-header))))
+
+    (push overlay gptel--message-overlays)
+
+    ;; Validate state if strict validation is enabled
+    (when (and gptel-enable-enhanced-state-tracking
+               gptel-enable-strict-validation)
+      (pcase-let ((`(,success . ,issues) (gptel--validate-conversation-state)))
+        (unless success
+          (gptel--log-validation 'warn "State validation failed after overlay creation: %s"
+                                (mapconcat #'identity issues "; ")))))
+
+    overlay))
+
+(defun gptel--cleanup-markers-and-overlays ()
+  "Clean up markers and overlays for the current buffer."
+  (when gptel--conversation-markers
+    (mapc (lambda (marker) (when (markerp marker) (set-marker marker nil)))
+          gptel--conversation-markers)
+    (setq gptel--conversation-markers nil))
+
+  (when gptel--message-overlays
+    (mapc #'delete-overlay gptel--message-overlays)
+    (setq gptel--message-overlays nil))
+
+  (when gptel--current-response-marker
+    (set-marker gptel--current-response-marker nil)
+    (setq gptel--current-response-marker nil)))
+
+;; State validation functions
+(defun gptel--log-validation (level message &rest args)
+  "Log validation MESSAGE at LEVEL with ARGS if logging is enabled."
+  (when (and gptel-enable-enhanced-state-tracking
+             gptel-validation-log-level)
+    (let ((should-log (pcase gptel-validation-log-level
+                        ('error (eq level 'error))
+                        ('warn (memq level '(error warn)))
+                        ('info (memq level '(error warn info)))
+                        ('debug t)
+                        (_ nil))))
+      (when should-log
+        (apply #'message (concat "[gptel-validation] " message) args)))))
+
+(defun gptel--detect-overlaps (overlays)
+  "Detect overlapping regions in OVERLAYS.
+Returns a list of overlapping overlay pairs."
+  (let ((overlaps '()))
+    (dolist (ov1 overlays)
+      (dolist (ov2 overlays)
+        (when (and (not (eq ov1 ov2))
+                   (overlay-buffer ov1)
+                   (overlay-buffer ov2)
+                   (< (overlay-start ov1) (overlay-end ov2))
+                   (< (overlay-start ov2) (overlay-end ov1)))
+          (push (cons ov1 ov2) overlaps))))
+    overlaps))
+
+(defun gptel--validate-message-bounds (overlays)
+  "Validate that message bounds in OVERLAYS don't overlap.
+Returns (SUCCESS . ISSUES) where SUCCESS is t if valid, ISSUES is a list of problems."
+  (let ((overlaps (gptel--detect-overlaps overlays))
+        (issues '()))
+
+    ;; Check for overlaps between different message roles
+    (dolist (overlap overlaps)
+      (let* ((ov1 (car overlap))
+             (ov2 (cdr overlap))
+             (role1 (overlay-get ov1 'gptel-role))
+             (role2 (overlay-get ov2 'gptel-role)))
+        (cond
+         ((not (eq role1 role2))
+          (push (format "Role overlap: %s message [%d-%d] overlaps with %s message [%d-%d]"
+                        role1 (overlay-start ov1) (overlay-end ov1)
+                        role2 (overlay-start ov2) (overlay-end ov2))
+                issues)
+          (gptel--log-validation 'error "Role overlap detected between %s and %s messages" role1 role2))
+         ((eq role1 role2)
+          (push (format "Same-role overlap: Two %s messages [%d-%d] and [%d-%d] overlap"
+                        role1 (overlay-start ov1) (overlay-end ov1)
+                        (overlay-start ov2) (overlay-end ov2))
+                issues)
+          (gptel--log-validation 'warn "Same-role overlap detected in %s messages" role1)))))
+
+    ;; Check for overlays with invalid positions
+    (dolist (ov overlays)
+      (when (overlay-buffer ov)
+        (let ((start (overlay-start ov))
+              (end (overlay-end ov)))
+          (cond
+           ((>= start end)
+            (push (format "Invalid overlay bounds: start %d >= end %d" start end) issues)
+            (gptel--log-validation 'error "Invalid overlay bounds: start %d >= end %d" start end))
+           ((< start (point-min))
+            (push (format "Overlay starts before buffer beginning: %d < %d" start (point-min)) issues)
+            (gptel--log-validation 'error "Overlay starts before buffer beginning"))
+           ((> end (point-max))
+            (push (format "Overlay ends after buffer end: %d > %d" end (point-max)) issues)
+            (gptel--log-validation 'error "Overlay ends after buffer end"))))))
+
+    (cons (null issues) issues)))
+
+(defun gptel--validate-overlay-consistency (overlays markers)
+  "Validate that OVERLAYS and MARKERS are consistent.
+Returns (SUCCESS . ISSUES) where SUCCESS is t if consistent, ISSUES is a list of problems."
+  (let ((issues '()))
+
+    ;; Check that each overlay has a corresponding marker
+    (dolist (ov overlays)
+      (when (overlay-buffer ov)
+        (let* ((start (overlay-start ov))
+               (role (overlay-get ov 'gptel-role))
+               (matching-marker (cl-find-if
+                                (lambda (m)
+                                  (and (markerp m)
+                                       (marker-buffer m)
+                                       (= (marker-position m) start)))
+                                markers)))
+          (unless matching-marker
+            (push (format "Overlay at %d (%s) has no corresponding marker" start role) issues)
+            (gptel--log-validation 'warn "Overlay at %d (%s) has no corresponding marker" start role)))))
+
+    ;; Check that markers are within overlay bounds
+    (dolist (marker markers)
+      (when (and (markerp marker) (marker-buffer marker))
+        (let* ((pos (marker-position marker))
+               (covering-overlay (cl-find-if
+                                 (lambda (ov)
+                                   (and (overlay-buffer ov)
+                                        (<= (overlay-start ov) pos)
+                                        (< pos (overlay-end ov))))
+                                 overlays)))
+          (unless covering-overlay
+            (push (format "Marker at %d is not covered by any overlay" pos) issues)
+            (gptel--log-validation 'warn "Marker at %d is not covered by any overlay" pos)))))
+
+    (cons (null issues) issues)))
+
+(defun gptel--repair-invalid-state (overlays markers)
+  "Attempt to repair invalid state in OVERLAYS and MARKERS.
+Returns (REPAIRED-OVERLAYS . REPAIRED-MARKERS)."
+  (let ((repaired-overlays '())
+        (repaired-markers '())
+        (overlaps (gptel--detect-overlaps overlays)))
+
+    (gptel--log-validation 'info "Attempting to repair invalid state...")
+
+    ;; Remove overlapping overlays, keeping the first (earliest) one
+    (dolist (ov overlays)
+      (let ((is-overlapping (cl-find-if (lambda (overlap)
+                                          (or (eq ov (car overlap))
+                                              (eq ov (cdr overlap))))
+                                        overlaps)))
+        (if is-overlapping
+            (progn
+              (gptel--log-validation 'debug "Removing overlapping overlay at %d-%d"
+                                    (overlay-start ov) (overlay-end ov))
+              (delete-overlay ov))
+          (push ov repaired-overlays))))
+
+    ;; Remove markers that don't have valid positions
+    (dolist (marker markers)
+      (if (and (markerp marker)
+               (marker-buffer marker)
+               (>= (marker-position marker) (point-min))
+               (<= (marker-position marker) (point-max)))
+          (push marker repaired-markers)
+        (progn
+          (gptel--log-validation 'debug "Removing invalid marker at %s"
+                                (if (markerp marker) (marker-position marker) "unknown"))
+          (when (markerp marker)
+            (set-marker marker nil))))))
+
+    (cons (nreverse repaired-overlays) (nreverse repaired-markers)))
+
+(defun gptel--validate-conversation-state ()
+  "Validate the current conversation state.
+Returns (SUCCESS . ISSUES) where SUCCESS is t if valid, ISSUES is a list of problems."
+  (unless gptel-enable-enhanced-state-tracking
+    (return-from gptel--validate-conversation-state (cons t '("Enhanced state tracking disabled"))))
+
+  (let ((all-issues '())
+        (overall-success t))
+
+    ;; Validate message bounds
+    (when gptel--message-overlays
+      (pcase-let ((`(,bounds-success . ,bounds-issues)
+                   (gptel--validate-message-bounds gptel--message-overlays)))
+        (unless bounds-success
+          (setq overall-success nil)
+          (setq all-issues (append all-issues bounds-issues)))))
+
+    ;; Validate overlay-marker consistency
+    (when (and gptel--message-overlays gptel--conversation-markers)
+      (pcase-let ((`(,consistency-success . ,consistency-issues)
+                   (gptel--validate-overlay-consistency gptel--message-overlays gptel--conversation-markers)))
+        (unless consistency-success
+          (setq overall-success nil)
+          (setq all-issues (append all-issues consistency-issues)))))
+
+    ;; Attempt repair if enabled and issues found
+    (when (and (not overall-success) gptel-auto-repair-invalid-state)
+      (gptel--log-validation 'info "Auto-repairing invalid state...")
+      (pcase-let ((`(,repaired-overlays . ,repaired-markers)
+                   (gptel--repair-invalid-state gptel--message-overlays gptel--conversation-markers)))
+        (setq gptel--message-overlays repaired-overlays)
+        (setq gptel--conversation-markers repaired-markers)
+        (gptel--log-validation 'info "State repair attempted")))
+
+    (cons overall-success all-issues)))
+
+(defun gptel--debug-conversation-state ()
+  "Debug the current conversation state by displaying detailed information."
+  (interactive)
+  (unless gptel-enable-enhanced-state-tracking
+    (message "Enhanced state tracking is not enabled")
+    (return-from gptel--debug-conversation-state))
+
+  (let ((marker-count (length gptel--conversation-markers))
+        (overlay-count (length gptel--message-overlays))
+        (validation-result (gptel--validate-conversation-state)))
+
+    (with-current-buffer (get-buffer-create "*gptel-debug*")
+      (erase-buffer)
+      (insert "=== GPTel Enhanced State Debug Information ===\n\n")
+
+      ;; Basic statistics
+      (insert (format "Markers: %d\n" marker-count))
+      (insert (format "Overlays: %d\n" overlay-count))
+      (insert (format "Validation: %s\n\n"
+                      (if (car validation-result) "VALID" "INVALID")))
+
+      ;; Validation issues
+      (when (cdr validation-result)
+        (insert "Validation Issues:\n")
+        (dolist (issue (cdr validation-result))
+          (insert (format "  - %s\n" issue)))
+        (insert "\n"))
+
+      ;; Marker details
+      (insert "=== Markers ===\n")
+      (if gptel--conversation-markers
+          (dolist (marker gptel--conversation-markers)
+            (if (and (markerp marker) (marker-buffer marker))
+                (insert (format "  Position: %d\n" (marker-position marker)))
+              (insert "  Invalid marker\n")))
+        (insert "  No markers\n"))
+      (insert "\n")
+
+      ;; Overlay details
+      (insert "=== Overlays ===\n")
+      (if gptel--message-overlays
+          (dolist (overlay gptel--message-overlays)
+            (if (overlay-buffer overlay)
+                (let ((start (overlay-start overlay))
+                      (end (overlay-end overlay))
+                      (role (overlay-get overlay 'gptel-role))
+                      (id (overlay-get overlay 'gptel-message-id)))
+                  (insert (format "  %s: [%d-%d] (ID: %s)\n"
+                                  role start end (or id "none"))))
+              (insert "  Invalid overlay\n")))
+        (insert "  No overlays\n"))
+      (insert "\n")
+
+      ;; Current response marker
+      (insert "=== Current Response Marker ===\n")
+      (if (and gptel--current-response-marker
+               (markerp gptel--current-response-marker)
+               (marker-buffer gptel--current-response-marker))
+          (insert (format "  Position: %d\n" (marker-position gptel--current-response-marker)))
+        (insert "  No current response marker\n"))
+
+      (goto-char (point-min))
+      (display-buffer (current-buffer)))
+
+    (message "Debug info: %d markers, %d overlays, %s"
+             marker-count overlay-count
+             (if (car validation-result) "valid" "invalid"))))
+
+(defun gptel--next-message ()
+  "Navigate to the next message in the conversation."
+  (interactive)
+  (unless gptel-enable-enhanced-state-tracking
+    (message "Enhanced state tracking is not enabled")
+    (return-from gptel--next-message))
+
+  (let ((current-pos (point))
+        (next-marker nil))
+    (when gptel--conversation-markers
+      (setq next-marker
+            (cl-find-if (lambda (marker)
+                          (and (markerp marker)
+                               (marker-buffer marker)
+                               (> (marker-position marker) current-pos)))
+                        (sort (copy-sequence gptel--conversation-markers)
+                              (lambda (a b) (< (marker-position a) (marker-position b))))))
+      (if next-marker
+          (progn
+            (goto-char (marker-position next-marker))
+            (message "Moved to next message at position %d" (marker-position next-marker)))
+        (message "No next message found")))))
+
+(defun gptel--previous-message ()
+  "Navigate to the previous message in the conversation."
+  (interactive)
+  (unless gptel-enable-enhanced-state-tracking
+    (message "Enhanced state tracking is not enabled")
+    (return-from gptel--previous-message))
+
+  (let ((current-pos (point))
+        (prev-marker nil))
+    (when gptel--conversation-markers
+      (setq prev-marker
+            (cl-find-if (lambda (marker)
+                          (and (markerp marker)
+                               (marker-buffer marker)
+                               (< (marker-position marker) current-pos)))
+                        (sort (copy-sequence gptel--conversation-markers)
+                              (lambda (a b) (> (marker-position a) (marker-position b))))))
+      (if prev-marker
+          (progn
+            (goto-char (marker-position prev-marker))
+            (message "Moved to previous message at position %d" (marker-position prev-marker)))
+        (message "No previous message found")))))
+
+(defun gptel--find-conversation-boundaries ()
+  "Find conversation boundaries using multiple strategies.
+Returns a list of (START . END) pairs representing message boundaries."
+  (let ((bounds '()))
+    ;; Strategy 1: Use existing overlays if available
+    (when gptel--message-overlays
+      (setq bounds (mapcar (lambda (ov) (cons (overlay-start ov) (overlay-end ov)))
+                          (cl-remove-if-not #'overlay-buffer gptel--message-overlays))))
+
+    ;; Strategy 2: Fall back to text properties (existing gptel behavior)
+    (unless bounds
+      (save-excursion
+        (save-restriction
+          (widen)
+          (goto-char (point-max))
+          (let ((prev-pt (point)))
+            (while (and (/= prev-pt (point-min))
+                        (goto-char (previous-single-property-change
+                                    (point) 'gptel nil (point-min))))
+              (when (get-char-property (point) 'gptel)
+                (push (cons (point) prev-pt) bounds))
+              (setq prev-pt (point)))))))
+
+    ;; Strategy 3: Parse org-mode headers as last resort
+    (unless bounds
+      (when (derived-mode-p 'org-mode)
+        (save-excursion
+          (goto-char (point-min))
+          (while (re-search-forward "^\\*\\* \\(Human\\|Assistant\\)" nil t)
+            (let ((start (line-beginning-position))
+                  (end (save-excursion
+                         (if (re-search-forward "^\\*\\* \\(Human\\|Assistant\\)" nil t)
+                             (line-beginning-position)
+                           (point-max)))))
+              (push (cons start end) bounds))))))
+
+    (nreverse bounds)))
+
+(defun gptel--rebuild-enhanced-state ()
+  "Rebuild enhanced state tracking from conversation boundaries."
+  (gptel--cleanup-markers-and-overlays)
+  (let ((bounds (gptel--find-conversation-boundaries)))
+    (dolist (bound bounds)
+      (let* ((start (car bound))
+             (end (cdr bound))
+             (role (gptel--detect-message-role start end)))
+        (gptel--create-message-marker start role)
+        (gptel--create-message-overlay start end role)))
+
+    ;; Validate the rebuilt state
+    (when gptel-enable-enhanced-state-tracking
+      (pcase-let ((`(,success . ,issues) (gptel--validate-conversation-state)))
+        (if success
+            (gptel--log-validation 'info "State rebuilt successfully")
+          (gptel--log-validation 'warn "State rebuild resulted in validation issues: %s"
+                                (mapconcat #'identity issues "; ")))))))
+
+(defun gptel--detect-message-role (start end)
+  "Detect whether the message from START to END is 'user or 'assistant."
+  (save-excursion
+    (goto-char start)
+    (cond
+     ;; Check text properties first
+     ((eq (get-char-property (point) 'gptel) 'response) 'assistant)
+     ((get-char-property (point) 'gptel) 'user)
+     ;; Check org-mode headers
+     ((and (derived-mode-p 'org-mode)
+           (looking-at "^\\*\\* \\(Human\\|Assistant\\)"))
+      (if (string= (match-string 1) "Human") 'user 'assistant))
+     ;; Default fallback
+     (t 'user))))
+
+(defun gptel--start-response-tracking (start-marker)
+  "Start tracking a new response at START-MARKER.
+Sets up the current response marker and creates an overlay for the response."
+  (setq gptel--current-response-marker start-marker)
+  (set-marker-insertion-type start-marker t)
+  ;; Create overlay for the response that will grow as it streams
+  (let ((overlay (make-overlay (marker-position start-marker)
+                               (marker-position start-marker))))
+    (overlay-put overlay 'gptel-role 'assistant)
+    (overlay-put overlay 'gptel-message-id (gptel--generate-message-id))
+    (overlay-put overlay 'gptel-timestamp (current-time))
+    (overlay-put overlay 'gptel-streaming t)
+    (overlay-put overlay 'face 'gptel-response)
+    (overlay-put overlay 'before-string "🤖 ")
+    (overlay-put overlay 'category 'gptel-message)
+    (overlay-put overlay 'evaporate t)
+    (push overlay gptel--message-overlays)
+    overlay))
+
+(defun gptel--update-response-tracking (tracking-marker)
+  "Update response tracking as content is streamed to TRACKING-MARKER."
+  (when (and gptel--current-response-marker tracking-marker)
+    ;; Update the overlay to cover the new content
+    (when-let* ((overlay (car (cl-remove-if-not
+                              (lambda (ov) (overlay-get ov 'gptel-streaming))
+                              gptel--message-overlays))))
+      (move-overlay overlay
+                    (marker-position gptel--current-response-marker)
+                    (marker-position tracking-marker)))))
+
+(defun gptel--finish-response-tracking ()
+  "Finish tracking the current response.
+Removes the streaming flag and finalizes the response overlay."
+  (when gptel--current-response-marker
+    ;; Remove streaming flag from the overlay
+    (when-let* ((overlay (car (cl-remove-if-not
+                              (lambda (ov) (overlay-get ov 'gptel-streaming))
+                              gptel--message-overlays))))
+      (overlay-put overlay 'gptel-streaming nil)
+      (overlay-put overlay 'gptel-completed (current-time)))
+    (setq gptel--current-response-marker nil)))
+
+;; Navigation and recovery functions
+(defun gptel-next-message ()
+  "Jump to the next message in the conversation."
+  (interactive)
+  (if-let* ((overlays (cl-remove-if-not #'overlay-buffer gptel--message-overlays))
+            (current-pos (point))
+            (next-overlay (cl-find-if
+                          (lambda (ov) (> (overlay-start ov) current-pos))
+                          (cl-sort overlays (lambda (a b) (< (overlay-start a) (overlay-start b)))))))
+      (goto-char (overlay-start next-overlay))
+    (message "No next message")))
+
+(defun gptel-previous-message ()
+  "Jump to the previous message in the conversation."
+  (interactive)
+  (if-let* ((overlays (cl-remove-if-not #'overlay-buffer gptel--message-overlays))
+            (current-pos (point))
+            (prev-overlay (cl-find-if
+                          (lambda (ov) (< (overlay-start ov) current-pos))
+                          (cl-sort overlays (lambda (a b) (> (overlay-start a) (overlay-start b)))))))
+      (goto-char (overlay-start prev-overlay))
+    (message "No previous message")))
+
+(defun gptel-jump-to-assistant-message ()
+  "Jump to the next assistant message."
+  (interactive)
+  (if-let* ((overlays (cl-remove-if-not #'overlay-buffer gptel--message-overlays))
+            (current-pos (point))
+            (assistant-overlay (cl-find-if
+                               (lambda (ov)
+                                 (and (> (overlay-start ov) current-pos)
+                                      (eq (overlay-get ov 'gptel-role) 'assistant)))
+                               (cl-sort overlays (lambda (a b) (< (overlay-start a) (overlay-start b)))))))
+      (goto-char (overlay-start assistant-overlay))
+    (message "No next assistant message")))
+
+(defun gptel-jump-to-user-message ()
+  "Jump to the next user message."
+  (interactive)
+  (if-let* ((overlays (cl-remove-if-not #'overlay-buffer gptel--message-overlays))
+            (current-pos (point))
+            (user-overlay (cl-find-if
+                          (lambda (ov)
+                            (and (> (overlay-start ov) current-pos)
+                                 (eq (overlay-get ov 'gptel-role) 'user)))
+                          (cl-sort overlays (lambda (a b) (< (overlay-start a) (overlay-start b)))))))
+      (goto-char (overlay-start user-overlay))
+    (message "No next user message")))
+
+(defun gptel-recover-conversation-state ()
+  "Recover conversation state using enhanced tracking.
+This rebuilds markers and overlays from conversation boundaries."
+  (interactive)
+  (if (not (bound-and-true-p gptel-mode))
+      (message "Not in a gptel buffer")
+    (gptel--rebuild-enhanced-state)
+    (message "Conversation state recovered (%d messages)"
+             (length gptel--message-overlays))))
+
+(defun gptel-show-message-info ()
+  "Show information about the message at point."
+  (interactive)
+  (if-let* ((overlay (cl-find-if
+                     (lambda (ov)
+                       (and (overlay-buffer ov)
+                            (<= (overlay-start ov) (point))
+                            (>= (overlay-end ov) (point))))
+                     gptel--message-overlays)))
+      (let ((role (overlay-get overlay 'gptel-role))
+            (id (overlay-get overlay 'gptel-message-id))
+            (timestamp (overlay-get overlay 'gptel-timestamp))
+            (streaming (overlay-get overlay 'gptel-streaming))
+            (completed (overlay-get overlay 'gptel-completed)))
+        (message "Message: %s (ID: %s) at %s%s"
+                 (capitalize (symbol-name role))
+                 id
+                 (if timestamp (format-time-string "%H:%M:%S" timestamp) "unknown")
+                 (if streaming " [streaming]" "")))
+    (message "No message at point")))
+
+;; Enhanced state persistence
+(defun gptel--save-enhanced-state ()
+  "Save enhanced state as file-local variables."
+  (when gptel--message-overlays
+    (let ((boundaries
+           (mapcar (lambda (ov)
+                     (list (overlay-start ov)
+                           (overlay-end ov)
+                           (overlay-get ov 'gptel-role)
+                           (overlay-get ov 'gptel-timestamp)
+                           (overlay-get ov 'gptel-message-id)))
+                   (cl-remove-if-not #'overlay-buffer gptel--message-overlays))))
+      (when boundaries
+        (add-file-local-variable 'gptel--message-boundaries boundaries)))))
+
+(defun gptel--restore-enhanced-state ()
+  "Restore enhanced state from file-local variables."
+  (when gptel--message-boundaries
+    (dolist (boundary gptel--message-boundaries)
+      (when (>= (length boundary) 3)
+        (let ((start (nth 0 boundary))
+              (end (nth 1 boundary))
+              (role (nth 2 boundary))
+              (timestamp (nth 3 boundary))
+              (message-id (nth 4 boundary)))
+          (when (and (numberp start) (numberp end) (< start end) (<= end (point-max)))
+            (let ((overlay (gptel--create-message-overlay start end role message-id)))
+              (when timestamp
+                (overlay-put overlay 'gptel-timestamp timestamp)))))))))
+
+;; Visual debugging functions
+(defvar-local gptel--debug-overlays nil
+  "Overlays created for visual debugging of conversation state.")
+
+(defun gptel-debug-conversation-state ()
+  "Show visual debugging of conversation state."
+  (interactive)
+  (if (not (bound-and-true-p gptel-mode))
+      (message "Not in a gptel buffer")
+    (gptel--clear-debug-overlays)
+    (let ((marker-count 0)
+          (overlay-count 0))
+
+      ;; Highlight markers
+      (dolist (marker gptel--conversation-markers)
+        (when (and (markerp marker) (marker-position marker))
+          (let ((debug-ov (make-overlay (marker-position marker)
+                                       (min (1+ (marker-position marker)) (point-max)))))
+            (overlay-put debug-ov 'face '(:background "red" :foreground "white"))
+            (overlay-put debug-ov 'before-string "●")
+            (overlay-put debug-ov 'priority 1000)
+            (overlay-put debug-ov 'gptel-debug-marker t)
+            (push debug-ov gptel--debug-overlays)
+            (cl-incf marker-count))))
+
+      ;; Highlight message overlays
+      (dolist (overlay gptel--message-overlays)
+        (when (overlay-buffer overlay)
+          (let ((debug-ov (make-overlay (overlay-start overlay) (overlay-end overlay))))
+            (overlay-put debug-ov 'face
+                        (if (eq (overlay-get overlay 'gptel-role) 'user)
+                            '(:background "blue" :foreground "white" :alpha 0.3)
+                          '(:background "green" :foreground "white" :alpha 0.3)))
+            (overlay-put debug-ov 'priority 500)
+            (overlay-put debug-ov 'gptel-debug-overlay t)
+            (push debug-ov gptel--debug-overlays)
+            (cl-incf overlay-count))))
+
+      (message "Debug view: %d markers, %d overlays" marker-count overlay-count))))
+
+(defun gptel--clear-debug-overlays ()
+  "Clear all debug overlays."
+  (when gptel--debug-overlays
+    (mapc #'delete-overlay gptel--debug-overlays)
+    (setq gptel--debug-overlays nil)))
+
+(defun gptel-clear-debug-view ()
+  "Clear the visual debugging overlays."
+  (interactive)
+  (gptel--clear-debug-overlays)
+  (message "Debug view cleared"))
+
+(defun gptel-toggle-debug-view ()
+  "Toggle visual debugging of conversation state."
+  (interactive)
+  (if gptel--debug-overlays
+      (gptel-clear-debug-view)
+    (gptel-debug-conversation-state)))
 
 (defvar gptel--num-messages-to-send nil)
 (put 'gptel--num-messages-to-send 'safe-local-variable #'always)
@@ -1438,7 +2168,10 @@ file."
           (when (natnump gptel--num-messages-to-send)
             (add-file-local-variable 'gptel--num-messages-to-send
                                      gptel--num-messages-to-send))
-          (add-file-local-variable 'gptel--bounds (gptel--get-buffer-bounds)))))))
+          (add-file-local-variable 'gptel--bounds (gptel--get-buffer-bounds))
+          ;; Save enhanced state tracking if enabled
+          (when gptel-enable-enhanced-state-tracking
+            (gptel--save-enhanced-state)))))))
 
 
 ;;; Minor mode and UI
@@ -1453,6 +2186,16 @@ file."
   :keymap
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c RET") #'gptel-send)
+    ;; Enhanced state tracking navigation
+    (define-key map (kbd "C-c C-n") #'gptel-navigate-to-next-message)
+    (define-key map (kbd "C-c C-p") #'gptel-navigate-to-previous-message)
+    (define-key map (kbd "C-c C-a") #'gptel-jump-to-assistant-message)
+    (define-key map (kbd "C-c C-u") #'gptel-jump-to-user-message)
+    (define-key map (kbd "C-c C-r") #'gptel-rebuild-conversation-state)
+    (define-key map (kbd "C-c C-i") #'gptel-show-message-info)
+    (define-key map (kbd "C-c C-d") #'gptel-debug-conversation-state)
+    (define-key map (kbd "C-c C-s") #'gptel-save-conversation-state)
+    (define-key map (kbd "C-c C-v") #'gptel-validate-conversation-state)
     map)
   (if gptel-mode
       (progn
@@ -1465,6 +2208,14 @@ file."
           ;; Work around bug in `org-fontify-extend-region'.
           (add-hook 'gptel-post-response-functions #'font-lock-flush nil t))
         (gptel--restore-state)
+        ;; Initialize enhanced state tracking if enabled
+        (when gptel-enable-enhanced-state-tracking
+          (gptel--rebuild-enhanced-state)
+          ;; Enable visual debugging if requested
+          (when gptel-enable-visual-debugging
+            (gptel-debug-conversation-state))
+          ;; Cleanup enhanced state on buffer kill
+          (add-hook 'kill-buffer-hook #'gptel--cleanup-markers-and-overlays nil t))
         (if gptel-use-header-line
           (setq gptel--old-header-line header-line-format
                 header-line-format
@@ -1555,6 +2306,10 @@ file."
                             (lambda (&rest _) (gptel-menu))))))))
     (remove-hook 'before-save-hook #'gptel--save-state t)
     (gptel--prettify-preset)
+    ;; Cleanup enhanced state tracking
+    (gptel--cleanup-markers-and-overlays)
+    (gptel--clear-debug-overlays)
+    (remove-hook 'kill-buffer-hook #'gptel--cleanup-markers-and-overlays t)
     (if gptel-use-header-line
         (setq header-line-format gptel--old-header-line
               gptel--old-header-line nil)
@@ -2855,7 +3610,12 @@ Optional RAW disables text properties and transformation."
              (insert response)
              (plist-put info :tracking-marker (setq tracking-marker (point-marker)))
              ;; for uniformity with streaming responses
-             (set-marker-insertion-type tracking-marker t)))))
+             (set-marker-insertion-type tracking-marker t)
+             ;; Update enhanced state tracking
+             (when (and start-marker tracking-marker)
+               (gptel--create-message-overlay (marker-position start-marker)
+                                            (marker-position tracking-marker)
+                                            'assistant)))))
       (`(reasoning . ,text)
        (when-let* ((include (plist-get info :include-reasoning)))
          (if (stringp include)
@@ -2892,7 +3652,7 @@ Optional RAW disables text properties and transformation."
       (`(tool-call . ,tool-calls)
        (gptel--display-tool-calls tool-calls info))
       (`(tool-result . ,tool-results)
-       (gptel--display-tool-results tool-results info)))))
+       (gptel--display-tool-results tool-results info))))))
 
 (defun gptel--create-prompt-buffer (&optional prompt-end)
   "Return a buffer with the conversation prompt to be sent.
@@ -3461,70 +4221,69 @@ for tool call results.  INFO contains the state of the request."
          with include-names =
          (mapcar #'gptel-tool-name
                  (cl-remove-if-not #'gptel-tool-include (plist-get info :tools)))
-         if (or (eq gptel-include-tool-results t)
-                (member (gptel-tool-name tool) include-names))
-         do (funcall
-             (plist-get info :callback)
-             (let* ((name (gptel-tool-name tool))
-                    (separator        ;Separate from response prefix if required
-                     (cond ((not tracking-marker)
-                            (and gptel-mode
-                                 (not (string-suffix-p
-                                       "\n" (gptel-response-prefix-string)))
-                                 "\n"))           ;start of response
-                           ((not (and tool-marker ;not consecutive tool result blocks
-                                      (= tracking-marker tool-marker)))
-                            gptel-response-separator)))
-                    (tool-use
-                     ;; TODO(tool) also check args since there may be more than
-                     ;; one call/result for the same tool
-                     (cl-find-if
-                      (lambda (tu) (equal (plist-get tu :name) name))
-                      (plist-get info :tool-use)))
-                    (id (plist-get tool-use :id))
-                    (display-call (format "(%s %s)" name
-                                          (string-trim (prin1-to-string args) "(" ")")))
-                    (call (prin1-to-string `(:name ,name :args ,args)))
-                    (truncated-call (truncate-string-to-width
-                                     display-call
-                                     (floor (* (window-width) 0.6)) 0 nil " ...)")))
-               (if (derived-mode-p 'org-mode)
+         do (when (or (eq gptel-include-tool-results t)
+                      (member (gptel-tool-name tool) include-names))
+              (funcall
+               (plist-get info :callback)
+               (let* ((name (gptel-tool-name tool))
+                      (separator        ;Separate from response prefix if required
+                       (cond ((not tracking-marker)
+                              (and gptel-mode
+                                   (not (string-suffix-p
+                                         "\n" (gptel-response-prefix-string)))
+                                   "\n"))           ;start of response
+                             ((not (and tool-marker ;not consecutive tool result blocks
+                                        (= tracking-marker tool-marker)))
+                              gptel-response-separator)))
+                      (tool-use
+                       ;; TODO(tool) also check args since there may be more than
+                       ;; one call/result for the same tool
+                       (cl-find-if
+                        (lambda (tu) (equal (plist-get tu :name) name))
+                        (plist-get info :tool-use)))
+                      (id (plist-get tool-use :id))
+                      (display-call (format "(%s %s)" name
+                                            (string-trim (prin1-to-string args) "(" ")")))
+                      (call (prin1-to-string `(:name ,name :args ,args)))
+                      (truncated-call (truncate-string-to-width
+                                       display-call
+                                       (floor (* (window-width) 0.6)) 0 nil " ..."))))
+                 (if (derived-mode-p 'org-mode)
+                     (concat
+                      separator
+                      "#+begin_tool "
+                      truncated-call
+                      (propertize
+                       (concat "\n" call "\n\n" (org-escape-code-in-string result))
+                       'gptel `(tool . ,id))
+                      "\n#+end_tool\n")
+                   ;; TODO(tool) else branch is handling all front-ends as markdown.
+                   ;; At least escape markdown.
                    (concat
                     separator
-                    "#+begin_tool "
-                    truncated-call
+                    ;; TODO(tool) remove properties and strip instead of ignoring
+                    (propertize (format "``` tool %s" truncated-call) 'gptel 'ignore)
                     (propertize
-                     (concat "\n" call "\n\n" (org-escape-code-in-string result))
+                     ;; TODO(tool) escape markdown in result
+                     (concat "\n" call "\n\n" result)
                      'gptel `(tool . ,id))
-                    "\n#+end_tool\n")
-                 ;; TODO(tool) else branch is handling all front-ends as markdown.
-                 ;; At least escape markdown.
-                 (concat
-                  separator
-                  ;; TODO(tool) remove properties and strip instead of ignoring
-                  (propertize (format "``` tool %s" truncated-call) 'gptel 'ignore)
-                  (propertize
-                   ;; TODO(tool) escape markdown in result
-                   (concat "\n" call "\n\n" result)
-                   'gptel `(tool . ,id))
-                  ;; TODO(tool) remove properties and strip instead of ignoring
-                  (propertize "\n```\n" 'gptel 'ignore))))
-             info
-             'raw)
-         ;; tool-result insertion has updated the tracking marker
-         (unless tracking-marker
-           (setq tracking-marker (plist-get info :tracking-marker)))
-         (if tool-marker
-               (move-marker tool-marker tracking-marker)
-             (setq tool-marker (copy-marker tracking-marker nil))
-             (plist-put info :tool-marker tool-marker))
+                    ;; TODO(tool) remove properties and strip instead of ignoring
+                    (propertize "\n```\n" 'gptel 'ignore))))
+               info 'raw)
+              ;; tool-result insertion has updated the tracking marker
+              (unless tracking-marker
+                (setq tracking-marker (plist-get info :tracking-marker)))
+              (if tool-marker
+                  (move-marker tool-marker tracking-marker)
+                (setq tool-marker (copy-marker tracking-marker nil))
+                (plist-put info :tool-marker tool-marker)))
          (when (derived-mode-p 'org-mode) ;fold drawer
            (ignore-errors
              (save-excursion
                (goto-char tracking-marker)
                (forward-line -1)
                (when (looking-at "^#\\+end_tool")
-                 (org-cycle))))))))))
+                 (org-cycle)))))))))
 
 (defun gptel--format-tool-call (name arg-values)
   "Format a tool call for display in the buffer.
@@ -3974,6 +4733,59 @@ context for the ediff session."
   "Switch to next gptel-response at this point, if it exists."
   (interactive "p")
   (gptel--previous-variant (- arg)))
+
+;; Public API functions for enhanced state tracking
+(defun gptel-debug-conversation-state ()
+  "Debug the current conversation state showing markers and overlays."
+  (interactive)
+  (if (and (bound-and-true-p gptel-enable-enhanced-state-tracking)
+           gptel-mode)
+      (gptel--debug-conversation-state)
+    (message "Enhanced state tracking not enabled or not in gptel-mode")))
+
+(defun gptel-rebuild-conversation-state ()
+  "Rebuild the conversation state from buffer contents."
+  (interactive)
+  (if (and (bound-and-true-p gptel-enable-enhanced-state-tracking)
+           gptel-mode)
+      (gptel--rebuild-enhanced-state)
+    (message "Enhanced state tracking not enabled or not in gptel-mode")))
+
+(defun gptel-navigate-to-next-message ()
+  "Navigate to the next message in the conversation."
+  (interactive)
+  (if (and (bound-and-true-p gptel-enable-enhanced-state-tracking)
+           gptel-mode)
+      (gptel--next-message)
+    (next-line)))
+
+(defun gptel-navigate-to-previous-message ()
+  "Navigate to the previous message in the conversation."
+  (interactive)
+  (if (and (bound-and-true-p gptel-enable-enhanced-state-tracking)
+           gptel-mode)
+      (gptel--previous-message)
+    (previous-line)))
+
+(defun gptel-save-conversation-state ()
+  "Save the current conversation state to file-local variables."
+  (interactive)
+  (if (and (bound-and-true-p gptel-enable-enhanced-state-tracking)
+           gptel-mode)
+      (gptel--save-enhanced-state)
+    (message "Enhanced state tracking not enabled or not in gptel-mode")))
+
+(defun gptel-validate-conversation-state ()
+  "Validate the current conversation state and report any issues."
+  (interactive)
+  (if (and (bound-and-true-p gptel-enable-enhanced-state-tracking)
+           gptel-mode)
+      (pcase-let ((`(,success . ,issues) (gptel--validate-conversation-state)))
+        (if success
+            (message "Conversation state is valid")
+          (message "Conversation state validation failed: %s"
+                   (mapconcat #'identity issues "; "))))
+    (message "Enhanced state tracking not enabled or not in gptel-mode")))
 
 (provide 'gptel)
 ;;; gptel.el ends here
